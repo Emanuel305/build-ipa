@@ -1,0 +1,113 @@
+name: Build iOS (qualquer projeto Flet)
+
+on:
+  workflow_dispatch:
+    inputs:
+      projeto:
+        description: "Nome da pasta dentro de projetos/ (ex: kwanzameter)"
+        required: true
+        type: string
+      nome_app:
+        description: "Nome do ficheiro .ipa (sem extensão)"
+        required: true
+        default: "app"
+        type: string
+      excluir:
+        description: "Pastas a remover antes do build (separadas por espaço)"
+        required: false
+        default: "backend kamba_backend"
+        type: string
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: projetos/${{ inputs.projeto }}
+    env:
+      PROJETO: ${{ inputs.projeto }}
+      NOME_APP: ${{ inputs.nome_app }}
+      EXCLUIR: ${{ inputs.excluir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verificar o projeto
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "Projetos disponíveis:"
+          ls projetos
+          if [ ! -f "projetos/$PROJETO/main.py" ] && [ ! -f "projetos/$PROJETO/src/main.py" ]; then
+            echo "ERRO: não encontrei main.py em projetos/$PROJETO"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar o Flet (mesma versão do projeto)
+        run: |
+          VER=$(cat pyproject.toml requirements.txt 2>/dev/null | sed -n 's/.*flet==\([0-9][0-9A-Za-z.+-]*\).*/\1/p' | head -n 1)
+          if [ -n "$VER" ]; then
+            echo "Versão do Flet: $VER"
+            pip install "flet[all]==$VER"
+          else
+            echo "AVISO: o projeto não fixa a versão do Flet; a usar a mais recente"
+            pip install "flet[all]"
+          fi
+
+      - name: Ajustar o projeto para iOS
+        run: |
+          for d in $EXCLUIR; do rm -rf "$d"; done
+          find . -name ".env*" -type f -delete
+          if [ -f pyproject.toml ]; then
+            sed -i '' '/flet-android-notifications/d' pyproject.toml
+            sed -i '' -E 's/^version = "[A-Za-z][^"]*"/version = "1.0.0"/' pyproject.toml
+          fi
+
+      - name: Compilar com o Flet
+        id: flet
+        continue-on-error: true
+        run: yes | flet build ipa -v
+
+      - name: Plano B, compilar direto com o Flutter
+        if: steps.flet.outcome == 'failure'
+        working-directory: projetos/${{ inputs.projeto }}/build/flutter
+        run: |
+          FLUTTER=$(ls -d "$HOME"/flutter/*/bin/flutter | head -n 1)
+          echo "Usando: $FLUTTER"
+          sed -i '' -E 's/^([[:space:]]+)jni:.*$/\1jni: ^1.1.0/' pubspec.yaml
+          "$FLUTTER" pub get
+          STATUS=0
+          "$FLUTTER" build ios --release --no-codesign -v \
+            --build-name 1.0.0 --build-number 1 \
+            --no-version-check --suppress-analytics \
+            > "$RUNNER_TEMP/flutter-ios.log" 2>&1 || STATUS=$?
+          echo "===== LINHAS COM ERRO ====="
+          grep -n -A4 -E "Error:|error:|assertion failed|FAILED" "$RUNNER_TEMP/flutter-ios.log" | tail -60 || true
+          exit $STATUS
+
+      - name: Guardar o log completo
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-flutter
+          path: ${{ runner.temp }}/flutter-ios.log
+          if-no-files-found: ignore
+
+      - name: Montar o .ipa
+        run: |
+          APP=$(find build -type d -name "*.app" -path "*iphoneos*" | head -n 1)
+          if [ -z "$APP" ]; then
+            APP=$(find build -type d -name "*.app" -path "*Products/Applications*" | head -n 1)
+          fi
+          echo "App encontrado: $APP"
+          test -n "$APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r "$NOME_APP.ipa" Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.nome_app }}-ios
+          path: projetos/${{ inputs.projeto }}/${{ inputs.nome_app }}.ipa
